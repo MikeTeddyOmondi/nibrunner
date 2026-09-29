@@ -45,17 +45,65 @@ stage-release dist:
     # on a listed file that is not there.
     cd "{{dist}}" && sha256sum nibrunnerd-linux-x64 vmlinux rootfs.ext4 manifest.json > checksums.txt
 
-# The version the next temporary prerelease carries, as CalVer `YYYY.M.D-N`, read off the tags.
-tmp-version:
+# The next release tag, as `YEAR.MONTH.PATCH`, with the patch counter starting at 0 each month.
+release-version:
     #!/usr/bin/env bash
     set -euo pipefail
-    today="$(date -u +%Y.%-m.%-d)"
-    # `-N` is on every release, the day's first included: semver ranks a version carrying a
-    # pre-release tag below the same version without one. The highest cut today rather than how
-    # many were, because counting the survivors of a day that lost its first release hands back a
-    # number the second one is still holding.
-    last="$(git tag --list "v$today-*" | sed "s/^v$today-//" | sort -n | tail -1)"
-    echo "v$today-$(( ${last:-0} + 1 ))"
+    month="$(date -u +%Y.%-m)"
+    # Use the highest surviving patch in case a tag was deleted. Prereleases do not advance it.
+    last="$(git tag --list "v$month.*" | sed -nE 's/^v[0-9]{4}\.[0-9]{1,2}\.(0|[1-9][0-9]*)$/\1/p' | sort -n | tail -1)"
+    echo "v$month.$(( ${last:--1} + 1 ))"
+
+[positional-arguments]
+prepare-release tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tag=$1
+    if [[ ! "$tag" =~ ^v[1-9][0-9]{3}\.(1[0-2]|[1-9])\.(0|[1-9][0-9]*)$ ]]; then
+        echo "release tags must use YEAR.MONTH.PATCH, such as v2026.9.0" >&2
+        exit 1
+    fi
+    if git show-ref --verify --quiet "refs/tags/$tag"; then
+        echo "$tag already exists" >&2
+        exit 1
+    fi
+    {{just_executable()}} set-release-version "${tag#v}"
+    cargo update --workspace
+    touch CHANGELOG.md
+    git cliff --unreleased --tag "$tag" --prepend CHANGELOG.md
+    {{just_executable()}} release-notes "$tag" > /dev/null
+
+[private]
+[positional-arguments]
+set-release-version version:
+    #!/usr/bin/env python3
+    import pathlib
+    import sys
+    import tomllib
+
+    manifest = pathlib.Path("Cargo.toml")
+    content = manifest.read_text()
+    current = tomllib.loads(content)["workspace"]["package"]["version"]
+    manifest.write_text(content.replace(f'version = "{current}"', f'version = "{sys.argv[1]}"', 1))
+
+[positional-arguments]
+release-notes tag:
+    #!/usr/bin/env python3
+    import pathlib
+    import re
+    import sys
+    import tomllib
+
+    tag = sys.argv[1]
+    version = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"]
+    if not re.fullmatch(r"v[1-9][0-9]{3}\.(1[0-2]|[1-9])\.(0|[1-9][0-9]*)", tag) or tag != f"v{version}":
+        raise SystemExit(f"release tag {tag} does not match the YEAR.MONTH.PATCH workspace version v{version}")
+    changelog = pathlib.Path("CHANGELOG.md").read_text()
+    sections = re.split(r"(?=^## \[)", changelog, flags=re.MULTILINE)
+    notes = next((section.strip() for section in sections if section.startswith(f"## [{version}] - ")), None)
+    if not notes or "\n- " not in notes:
+        raise SystemExit(f"CHANGELOG.md has no release notes for {tag}; merge the prepare-release PR first")
+    print(notes)
 
 # Everything that needs no kernel: the planner, the codecs, the ruleset, the reconcile.
 test:

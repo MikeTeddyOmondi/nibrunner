@@ -9,7 +9,7 @@ Rust workspace (`crates/*`) with the docs site under `docs/`.
 ## Stack
 
 - **Language:** Rust; the host binary is one static x86_64 musl binary
-- **Tasks:** `just`; `mise` installs `just` and `bun`
+- **Tasks:** `just`; `mise` installs the tools pinned in `mise.toml`
 - **Linter/Formatter:** rustfmt and clippy for the Rust, Biome (`docs/biome.json`) for the docs
   site; editors format on save
 - **State:** SQLite through sqlx, with the offline query data committed under `.sqlx/`
@@ -115,6 +115,16 @@ anything else crosses through `zig` and `cargo-zigbuild`. The daemon's `build.rs
 Firecracker release it pins and embeds it; `NIBRUNNER_FIRECRACKER_BINARY` points it at one to build
 without fetching. `just guest-image` builds `guest/rootfs.ext4` and needs Linux, root, docker and
 e2fsprogs.
+
+## Releases
+
+Run `prepare-release` on GitHub to open a release PR from `main`. `git-cliff`, pinned to a minor version in
+`mise.toml` and configured by `cliff.toml`, writes `CHANGELOG.md` from Conventional Commits. Tags
+use `vYEAR.MONTH.PATCH` in UTC, without zero padding. The patch starts at 0 each month and increments
+from the highest stable tag; historical date-counter prereleases do not advance it. The PR updates
+the workspace version in `Cargo.toml` and `Cargo.lock`. `just release-notes <tag>` validates the
+prepared version and reads its notes from the changelog. Publication still uses the manual
+`tmp-release` workflow.
 
 ## Run scripts
 
