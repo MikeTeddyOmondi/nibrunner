@@ -12,7 +12,8 @@ Rust workspace (`crates/*`) with the docs site under `docs/`.
 - **Tasks:** `just`; `mise` installs the tools pinned in `mise.toml`
 - **Linter/Formatter:** rustfmt and clippy for the Rust, Biome (`docs/biome.json`) for the docs
   site; editors format on save
-- **State:** SQLite through sqlx, with the offline query data committed under `.sqlx/`
+- **State:** SQLite through sqlx, with the offline query data committed under `.sqlx/`. New
+  tables store fields in columns and related rows, without JSON records.
 - **Docs:** Fumadocs on Bun under `docs/`, served at [nibrunner.dev](https://nibrunner.dev)
 - **Commits:** Conventional Commits, checked on pull request titles by `check-pr-title`
 
@@ -114,9 +115,10 @@ invariant. Both are gated on `NIBRUNNER_INTEGRATION=1`. What more than one test 
 asserted as text, the codecs against byte fixtures taken from the C headers, and the reconcile pass
 driven against mocked collaborators.
 
-`crates/nibrunnerd/migrations/0001_host_state.sql` is edited in place rather than followed by a
-`0002` while nobody runs a host that has to survive an upgrade. Do not propose a new migration file
-for a schema change, and do not flag the edit.
+Hosts may already be in use. Keep existing files in `crates/nibrunnerd/migrations` unchanged:
+sqlx verifies their checksums when a host opens its database. Add a new numbered migration for
+each schema change, and test upgrading an existing database without losing its state. Schema
+migrations contain DDL only: no inserts, updates, deletes, backfills, or table-copy operations.
 
 ## Building
 
