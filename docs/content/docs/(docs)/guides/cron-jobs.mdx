@@ -1,0 +1,78 @@
+---
+title: Cron jobs
+description: Schedule commands with crontab.
+---
+
+Use `crontab` inside the app to schedule commands for its current deployment.
+
+## Configure the host
+
+Add `[cron]` to `config.toml`:
+
+```toml
+[cron]
+max_jobs_per_app = 10
+time_zone = "Europe/Zurich"
+```
+
+Both settings are required and have no defaults.
+
+- `max_jobs_per_app` limits the jobs an app can install.
+- `time_zone` sets the IANA time zone for all apps.
+
+## Install a crontab
+
+Run these commands inside the app:
+
+| Command | Action |
+| --- | --- |
+| `crontab /app/crontab` | Install a file. |
+| `crontab -l` | Print the installed crontab. |
+| `crontab -r` | Remove the crontab. |
+
+To install from standard input:
+
+```sh
+printf '0 * * * * /app/bin/cleanup\n' | crontab -
+```
+
+Installing a crontab replaces all jobs. Invalid crontabs leave the previous jobs unchanged.
+
+## Schedule syntax
+
+Schedules have five fields followed by a command:
+
+```text
+minute hour day-of-month month day-of-week command
+```
+
+Fields accept lists, ranges, steps, and month or weekday names. Supported aliases are `@hourly`,
+`@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, and `@annually`. `@reboot` is rejected.
+
+Environment assignments apply to the jobs below them:
+
+```text
+MODE=maintenance
+30 2 * * * /app/bin/cleanup
+```
+
+Jobs use the host's time zone. A different `CRON_TZ` is rejected. During daylight saving changes,
+skipped times shift forward by the clock change. Repeated times run once.
+
+## Execution
+
+The host wakes sleeping apps to run due jobs. Commands run with the app's user, working
+directory, and environment, using `/bin/sh` or `SHELL` if set. Crontab assignments override the
+app's environment.
+
+- Running commands keep the guest awake.
+- Runs of the same job can overlap.
+- The host does not replay jobs missed while the daemon was stopped.
+- Editing or removing a crontab changes future runs. Running commands continue.
+
+Standard output and standard error go to the app's [logs](/docs/guides/logs-and-metrics).
+Each line includes a job ID and a run ID.
+
+Stopping an app cancels running commands and pauses scheduling. Replacing or removing a
+deployment also removes its crontab. The host waits for cancelled runs before stopping the guest.
+New deployments must install their own crontabs.
