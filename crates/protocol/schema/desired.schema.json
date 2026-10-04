@@ -335,25 +335,46 @@
       "description": "One read-only layer of the root filesystem an instance boots into. Layers stack in the order\nthe document lists them, first at the bottom, and the app's volume is stacked writable over\nall of them. The kind says what the object is, and so what the host does with it.",
       "oneOf": [
         {
-          "description": "An OCI image-layout archive for Linux x86_64, flattened and packed by the host. Its image\nconfiguration does not replace the instance's explicit command or guest account.",
+          "description": "An OCI image for Linux x86_64, from an artifact-store archive or public registry. Its image\nconfiguration does not replace the instance's explicit command or guest account.",
           "type": "object",
           "properties": {
-            "digest": {
-              "$ref": "#/$defs/Sha256Digest"
-            },
             "kind": {
               "type": "string",
               "const": "oci"
-            },
-            "objectKey": {
-              "description": "Where the object lives in the store.",
-              "$ref": "#/$defs/ObjectKey"
             }
           },
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StoredObject",
+              "not": {
+                "required": [
+                  "repository"
+                ]
+              }
+            },
+            {
+              "type": "object",
+              "properties": {
+                "digest": {
+                  "$ref": "#/$defs/Sha256Digest"
+                },
+                "repository": {
+                  "$ref": "#/$defs/OciRepository"
+                }
+              },
+              "not": {
+                "required": [
+                  "objectKey"
+                ]
+              },
+              "required": [
+                "repository",
+                "digest"
+              ]
+            }
+          ],
           "required": [
-            "kind",
-            "digest",
-            "objectKey"
+            "kind"
           ]
         },
         {
@@ -674,6 +695,12 @@
       "maxLength": 1024,
       "minLength": 1
     },
+    "OciRepository": {
+      "description": "a lowercase registry hostname and repository path, without a scheme, tag or digest",
+      "type": "string",
+      "maxLength": 255,
+      "pattern": "^(localhost|[a-z0-9]+([.-][a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*)(:[0-9]{1,5})?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)+$"
+    },
     "PortName": {
       "description": "lowercase letters, digits and dashes, starting with a letter",
       "type": "string",
@@ -772,6 +799,23 @@
             "ttlMs"
           ]
         }
+      ]
+    },
+    "StoredObject": {
+      "description": "An object in the store the host's `artifacts.store_url` names, checked against `digest`\nbefore anything is made from it. The digest is the whole of what is checked: a `sizeBytes`\nbeside it, which a document used to carry, is read past.",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "objectKey": {
+          "description": "Where the object lives in the store.",
+          "$ref": "#/$defs/ObjectKey"
+        }
+      },
+      "required": [
+        "digest",
+        "objectKey"
       ]
     },
     "TenantArguments": {
