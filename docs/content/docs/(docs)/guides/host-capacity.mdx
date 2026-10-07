@@ -122,3 +122,26 @@ release handshake. A guest that does not initialize within 60 seconds is stopped
 and releases its permit. Deferred boots remain pending without spending the app's
 restart budget. Application health checks, artifact preparation and volume
 attachment are outside this limit. HTTP request concurrency is separate.
+
+
+## VM CPU and memory limits
+
+Every new VM boot and snapshot restore applies cgroup v2 limits through the
+Firecracker jailer. The app's [`resources`](/docs/reference/desired#instanceresources)
+in desired state supplies both values; no additional host configuration is needed.
+
+| Resource | Host limit |
+| --- | --- |
+| CPU | `vcpuCount` host CPUs in aggregate, over each 100 ms period. |
+| Memory | `memoryMib` plus 64 MiB and 12.5% of guest RAM for Firecracker and kernel overhead. |
+| Swap | Disabled for the VM process. |
+
+For example, a VM with 1 vCPU and 256 MiB of guest RAM has a 100% CPU ceiling and
+a 352 MiB host memory ceiling. CPU limits throttle the whole VMM, including its
+I/O threads. Exceeding the memory ceiling can kill the VM; its existing restart
+policy handles that exit. The allowance is covered by guest boot, memory pressure,
+sleep and restore tests; it does not reserve physical memory or change admission.
+
+The host must provide the cgroup v2 CPU and memory controllers. If limits cannot
+be applied, the VM fails to start. Existing VMs keep their current limits until
+their next boot or restore; restarting the daemon readopts them.

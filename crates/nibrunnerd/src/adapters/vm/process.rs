@@ -151,6 +151,8 @@ impl VmProcesses {
         let _ = std::fs::remove_file(self.record_path(app_id));
         let _ = std::fs::remove_file(self.api_socket(app_id));
         let _ = std::fs::remove_file(self.console_path(app_id));
+        #[cfg(target_os = "linux")]
+        let _ = std::fs::remove_dir(super::limits::cgroup_path(app_id));
     }
 
     pub fn adopted_app_ids(&self) -> Vec<AppId> {
@@ -216,10 +218,9 @@ impl VmProcesses {
             .arg("--cgroup-version")
             .arg("2")
             .arg("--parent-cgroup")
-            .arg("nibrunner-jailer")
-            .arg("--")
-            .arg("--api-sock")
-            .arg("/api.sock");
+            .arg(super::limits::CGROUP_PARENT);
+        jail.limits.configure(&mut command);
+        command.arg("--").arg("--api-sock").arg("/api.sock");
         if boot {
             command.arg("--config-file").arg("/firecracker.json");
         }
@@ -259,12 +260,29 @@ impl VmProcesses {
         {
             #[allow(
                 unsafe_code,
-                reason = "there is no safe way to call setsid between fork and exec"
+                reason = "session and OOM policy must be set between fork and exec"
             )]
             unsafe {
                 command.pre_exec(|| {
                     if libc::setsid() < 0 {
                         return Err(std::io::Error::last_os_error());
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        // The daemon is OOM-protected; a VMM must remain killable at its memory ceiling.
+                        let descriptor = libc::open(
+                            c"/proc/self/oom_score_adj".as_ptr(),
+                            libc::O_WRONLY | libc::O_CLOEXEC,
+                        );
+                        if descriptor < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        let written = libc::write(descriptor, c"0".as_ptr().cast(), 1);
+                        let error = std::io::Error::last_os_error();
+                        libc::close(descriptor);
+                        if written != 1 {
+                            return Err(error);
+                        }
                     }
                     Ok(())
                 });
@@ -624,7 +642,9 @@ mod tests {
             "--uid",
             "--gid",
             "--chroot-base-dir",
-            "--api-sock /api.sock",
+            "--cgroup cpu.max=100000 100000",
+            "--cgroup memory.max=369098752",
+            "--cgroup memory.swap.max=0 -- --api-sock /api.sock",
         ] {
             assert!(console.contains(argument), "{console}");
         }
