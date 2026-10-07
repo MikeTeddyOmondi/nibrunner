@@ -197,6 +197,7 @@ pub struct CronConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
+    pub max_concurrent_vm_starts: std::num::NonZeroU16,
     /// How many apps this host is laid out for. Everything that counts slots follows from it —
     /// the ring the allocator walks, the loopback ports reserved, the nbd minors the module is
     /// loaded with, the conntrack table's size, what the metrics page calls the total — and
@@ -302,6 +303,9 @@ mod file {
         /// and ports; `start` says the three against what is set.
         #[schemars(range(min = 1, max = nft_render::most_apps_the_ports_fit()))]
         pub(super) max_apps: Option<u32>,
+        /// Host-wide bound on simultaneous VM boots and snapshot restores. Required, from 1 to 65535.
+        /// `install` writes 2; changing it requires `nibrunnerd start`.
+        pub(super) max_concurrent_vm_starts: Option<std::num::NonZeroU16>,
         /// Cron registration and scheduling policy for every app on this host.
         pub(super) cron: Option<Cron>,
         /// Where this host keeps what is its own.
@@ -713,6 +717,10 @@ impl HostConfig {
         let logs = logs(document.logs.as_ref())?;
 
         Ok(Self {
+            max_concurrent_vm_starts: required(
+                "max_concurrent_vm_starts",
+                document.max_concurrent_vm_starts,
+            )?,
             max_apps,
             cron,
             snapshot_dir: path_key("paths.snapshot_dir", &paths.snapshot_dir)?,
@@ -813,6 +821,7 @@ impl HostConfig {
             proxy: ProxyConfig::default(),
             metrics: None,
             filesystem: None,
+            max_concurrent_vm_starts: std::num::NonZeroU16::new(2).expect("a positive start limit"),
             logs: LogsConfig::default(),
             export_store_url: state_dir.join("export-store").display().to_string(),
             export_staging_dir: state_dir.join("exports"),
@@ -889,6 +898,7 @@ impl HostConfig {
             filesystem: Some(FilesystemConfig {
                 socket: PathBuf::from("/run/nibrunner/filesystem.sock"),
             }),
+            max_concurrent_vm_starts: std::num::NonZeroU16::new(2).expect("a positive start limit"),
             logs: LogsConfig::default(),
             export_store_url: "s3://nibrunner-exports-eu-west-2-123456789012/exports".to_string(),
             export_staging_dir: PathBuf::from("/var/lib/nibrunner/exports"),
@@ -992,6 +1002,7 @@ impl HostConfig {
             filesystem: self.filesystem.as_ref().map(|filesystem| file::Filesystem {
                 socket: text(&filesystem.socket),
             }),
+            max_concurrent_vm_starts: Some(self.max_concurrent_vm_starts),
             logs: Some(file::Logs {
                 keep_mib_per_app: Some(self.logs.keep_bytes_per_app / BYTES_PER_MEBIBYTE),
             }),
@@ -1354,6 +1365,7 @@ mod tests {
     /// The smallest document this daemon accepts. Every key it reads is in here, because there is
     /// no key it will supply for itself, so a test about one key starts from the whole document.
     const WHOLE: &str = r#"max_apps = 1000
+max_concurrent_vm_starts = 2
 
 [cron]
 max_jobs_per_app = 10
@@ -1497,9 +1509,35 @@ denied_egress_addresses_v6 = []
     }
 
     #[test]
+    fn vm_start_concurrency_is_required_and_accepts_only_positive_u16_limits() {
+        let original = HostConfig::starter(10).to_toml();
+        let validator = jsonschema::validator_for(&HostConfig::schema().to_value()).unwrap();
+        let json = |text: &str| serde_json::to_value(toml::from_str::<toml::Value>(text).unwrap()).unwrap();
+        for limit in [1, 65535] {
+            let valid = original.replace(
+                "max_concurrent_vm_starts = 2",
+                &format!("max_concurrent_vm_starts = {limit}"),
+            );
+            let config = HostConfig::from_toml(&valid).unwrap();
+            assert_eq!(config.max_concurrent_vm_starts.get(), limit);
+            assert_eq!(HostConfig::from_toml(&config.to_toml()).unwrap(), config);
+            assert!(validator.is_valid(&json(&valid)));
+        }
+        for invalid in [
+            original.replace("max_concurrent_vm_starts = 2", "max_concurrent_vm_starts = 0"),
+            original.replace("max_concurrent_vm_starts = 2", "max_concurrent_vm_starts = 65536"),
+            original.replace("max_concurrent_vm_starts = 2\n", ""),
+        ] {
+            assert!(HostConfig::from_toml(&invalid).is_err());
+            assert!(!validator.is_valid(&json(&invalid)));
+        }
+    }
+
+    #[test]
     fn a_key_the_document_leaves_out_is_refused_rather_than_filled_in() {
         for field in [
             "max_apps",
+            "max_concurrent_vm_starts",
             "cron.max_jobs_per_app",
             "cron.time_zone",
             "paths.state_dir",
@@ -2284,6 +2322,7 @@ keep_mib_per_app = 64
             let validator = validator();
             let mut broken: Vec<String> = [
                 "max_apps",
+                "max_concurrent_vm_starts",
                 "cron.max_jobs_per_app",
                 "cron.time_zone",
                 "paths.state_dir",
