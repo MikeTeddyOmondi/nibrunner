@@ -265,6 +265,10 @@
       "description": "The one HTTP listener, where the edge reaches it. One per host: nothing here redirects, so a\nplain port beside a TLS one would serve every app both ways forever.",
       "type": "object",
       "properties": {
+        "concurrency": {
+          "description": "Absent preserves unlimited concurrent HTTP requests. Changes require `nibrunnerd start`.",
+          "$ref": "#/$defs/proxy.http.concurrency"
+        },
         "listen_address": {
           "description": "An IP address to bind.",
           "type": "string"
@@ -285,6 +289,31 @@
       "required": [
         "listen_address",
         "port"
+      ]
+    },
+    "proxy.http.concurrency": {
+      "description": "Optional limits on requests through the hostname router. Omission preserves unrestricted ingress.",
+      "type": "object",
+      "properties": {
+        "app_concurrent": {
+          "description": "Limit applied to every app. Aliases of an app share this capacity.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "host_concurrent": {
+          "description": "Requests across all routed apps, including those waiting for a wake or streaming a body.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "host_concurrent",
+        "app_concurrent"
       ]
     },
     "proxy.http.tls": {

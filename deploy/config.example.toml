@@ -67,6 +67,10 @@ key = "/etc/nibrunner/tls/origin.key"
 [proxy.http.tls.client_ca]
 certificate = "/etc/nibrunner/tls/origin-pull-ca.pem"
 
+[proxy.http.concurrency]
+host_concurrent = 128
+app_concurrent = 16
+
 [proxy.raw]
 listen_address = "10.0.5.18"
 max_ports_per_guest = 1

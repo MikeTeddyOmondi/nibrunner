@@ -85,6 +85,17 @@ pub struct ZerofsSettings {
     pub checkpoint_cache_dir: PathBuf,
 }
 
+/// Optional limits on requests through the hostname router. Omission preserves unrestricted ingress.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "proxy.http.concurrency")]
+pub struct HttpConcurrency {
+    /// Requests across all routed apps, including those waiting for a wake or streaming a body.
+    pub host_concurrent: std::num::NonZeroU16,
+    /// Limit applied to every app. Aliases of an app share this capacity.
+    pub app_concurrent: std::num::NonZeroU16,
+}
+
 /// Where the world reaches an app on this host.
 ///
 /// Every way in is a section under here, and each is absent or complete: there is no
@@ -106,6 +117,7 @@ pub struct ProxyConfig {
 /// at once, forever, with nothing moving a visitor from the first to the second.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpListener {
+    pub concurrency: Option<HttpConcurrency>,
     pub listen_address: IpAddr,
     pub port: u16,
     /// Absent serves plain HTTP, which is what a host behind an edge that terminates TLS wants.
@@ -491,6 +503,9 @@ mod file {
         /// terminates TLS wants.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(super) tls: Option<Tls>,
+        /// Absent preserves unlimited concurrent HTTP requests. Changes require `nibrunnerd start`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(super) concurrency: Option<super::HttpConcurrency>,
     }
 
     /// One certificate for the whole host — there is no SNI selection, so a wildcard in practice —
@@ -760,6 +775,7 @@ impl HostConfig {
         );
         starter.max_apps = max_apps;
         starter.proxy.http = Some(HttpListener {
+            concurrency: None,
             listen_address: IpAddr::from([0, 0, 0, 0]),
             port: 80,
             tls: None,
@@ -849,6 +865,10 @@ impl HostConfig {
             denied_egress_addresses_v6: vec![],
             proxy: ProxyConfig {
                 http: Some(HttpListener {
+                    concurrency: Some(HttpConcurrency {
+                        host_concurrent: std::num::NonZeroU16::new(128).expect("positive limit"),
+                        app_concurrent: std::num::NonZeroU16::new(16).expect("positive limit"),
+                    }),
                     listen_address: IpAddr::from([0, 0, 0, 0]),
                     port: 443,
                     tls: Some(TlsMaterial {
@@ -949,6 +969,7 @@ impl HostConfig {
             // Left out rather than written as an empty `[proxy]`: both read back the same.
             proxy: (self.proxy != ProxyConfig::default()).then(|| file::Proxy {
                 http: self.proxy.http.as_ref().map(|http| file::Http {
+                    concurrency: http.concurrency.clone(),
                     listen_address: Some(http.listen_address.to_string()),
                     port: Some(http.port),
                     tls: http.tls.as_ref().map(|tls| file::Tls {
@@ -1031,6 +1052,7 @@ fn proxy(document: Option<&file::Proxy>, max_apps: u32) -> Result<ProxyConfig, C
         .as_ref()
         .map(|http| {
             Ok::<_, ConfigError>(HttpListener {
+                concurrency: http.concurrency.clone(),
                 listen_address: bind_address("proxy.http.listen_address", &http.listen_address)?,
                 port: listener(
                     "proxy.http.port",
@@ -1444,6 +1466,34 @@ denied_egress_addresses_v6 = []
 
     fn refused(text: &str) -> String {
         HostConfig::from_toml(text).unwrap_err().message()
+    }
+
+    #[test]
+    fn http_concurrency_is_opt_in_and_refuses_zero_unknown_and_out_of_range_limits() {
+        let original = HostConfig::starter(10).to_toml();
+        assert!(HostConfig::from_toml(&original)
+            .unwrap()
+            .proxy
+            .http
+            .unwrap()
+            .concurrency
+            .is_none());
+        let valid = format!("{original}\n[proxy.http.concurrency]\nhost_concurrent=8\napp_concurrent=2\n");
+        let enabled = HostConfig::from_toml(&valid).unwrap();
+        let validator = jsonschema::validator_for(&HostConfig::schema().to_value()).unwrap();
+        let json = |text: &str| serde_json::to_value(toml::from_str::<toml::Value>(text).unwrap()).unwrap();
+        assert!(validator.is_valid(&json(&valid)));
+        assert_eq!(HostConfig::from_toml(&enabled.to_toml()).unwrap(), enabled);
+        for invalid in [
+            valid.replace("host_concurrent=8", "host_concurrent=0"),
+            valid.replace("app_concurrent=2", "app_concurrent=65536"),
+            format!("{valid}\n[proxy.http.concurrency.apps]\napp-one=3\n"),
+            valid.replace("app_concurrent=2", "unknown=2"),
+            valid.replace("proxy.http.concurrency", "http_concurrency"),
+        ] {
+            assert!(HostConfig::from_toml(&invalid).is_err());
+            assert!(!validator.is_valid(&json(&invalid)), "{invalid}");
+        }
     }
 
     #[test]
@@ -2146,6 +2196,7 @@ keep_mib_per_app = 64
         assert_eq!(
             config.proxy.http,
             Some(HttpListener {
+                concurrency: None,
                 listen_address: IpAddr::from([0, 0, 0, 0]),
                 port: 443,
                 tls: Some(TlsMaterial {
