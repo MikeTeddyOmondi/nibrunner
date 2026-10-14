@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -53,3 +54,14 @@ jobs:
             --notes-file "$RUNNER_TEMP/release-notes.md" \
             --latest \
             "$RUNNER_TEMP/dist"/*
+
+      - name: Install nibrun cli
+        uses: nibrunhq/setup-cli@a753b7a37b34d0389298f6b1647cff63a3993724 # v1.0.1
+        with:
+          version: latest
+
+      - name: Deploy the docs site
+        run: |
+          nib run docs/dist/app \
+            --github-trusted-oidc \
+            --app-id 01a09eb8-ea7a-73d2-98c8-bec0742e4fee
