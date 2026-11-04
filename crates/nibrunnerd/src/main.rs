@@ -3,7 +3,7 @@
 mod cli;
 
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, StorageCommand};
 use nibrunnerd::config::HostConfig;
 use nibrunnerd::controllers::lifecycle_controller::LifecycleController;
 use nibrunnerd::install::Origin;
@@ -41,6 +41,20 @@ fn main() -> std::process::ExitCode {
             force,
             restart_zerofs,
         }) => runtime.block_on(bring_up(config, force, restart_zerofs)),
+        Some(Command::Storage { command }) => {
+            let result = match command {
+                StorageCommand::Prepare => install::storage::prepare(&config),
+                StorageCommand::Ready => install::storage::ready(&config),
+                StorageCommand::Check => install::storage::check(&config),
+            };
+            match result {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("{}", error.message());
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 
@@ -121,7 +135,7 @@ fn configuration(command: Option<&Command>) -> Result<(HostConfig, Origin), std:
     let refused = |error: &nibrunnerd::config::ConfigError| {
         match command {
             None => tracing::error!(error = %error.message(), "this host is not configured"),
-            Some(Command::Install { .. } | Command::Start { .. }) => {
+            Some(Command::Install { .. } | Command::Start { .. } | Command::Storage { .. }) => {
                 eprintln!("this host is not configured: {}", error.message())
             }
         }

@@ -1,5 +1,5 @@
-//! `nibrunnerd start`: the host `install` laid out, asked of systemd. Everything before this point
-//! writes files; this is the one place that asks for them to be run, and it asks only after
+//! `nibrunnerd start`: the host `install` laid out, asked of systemd. Installation has already
+//! mounted configured storage; this asks for the services to run, and it asks only after
 //! checking what a start would otherwise find out too late and say from too far away — a secret
 //! still empty in `host.env`, a certificate the configuration names that is not there or that
 //! holds fewer certificates than it marks. With those checked, a start that fails is one the
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::adapters::proxy::pem::read_certificates;
 use crate::config::HostConfig;
 use crate::install::render::{DAEMON_UNIT, MOUNT_UNIT, ZEROFS_UNIT};
+use crate::install::storage::{self, READY_UNIT};
 use crate::install::{secrets, SYSTEMD_DIR};
 
 mod inputs;
@@ -122,7 +123,11 @@ fn activate(
     }
     must(systemd, &["daemon-reload"])?;
     let mut enable = vec!["enable"];
-    enable.extend(plan.iter().map(|service| service.unit));
+    enable.extend(
+        plan.iter()
+            .map(|service| service.unit)
+            .filter(|unit| *unit != READY_UNIT),
+    );
     must(systemd, &enable)?;
 
     let mut units = Vec::new();
@@ -164,7 +169,9 @@ fn activate(
                 None => {}
             }
         }
-        let restart = pending || unit == DAEMON_UNIT;
+        // Installation already applied storage preparation. Restarting its oneshot would stop
+        // the services that require it, including a running ZeroFS.
+        let restart = unit != READY_UNIT && (pending || unit == DAEMON_UNIT);
         // A failed or interrupted activation may already have replaced the process, even if
         // the operator subsequently restores the previous files.
         service.inputs.invalidate()?;
@@ -295,12 +302,26 @@ fn plan(config: &HostConfig, systemd_dir: &Path, binary: &Path) -> Result<Vec<Se
             inputs: Inputs::read(paths, inputs::receipt(&config.state_dir, unit))?,
         })
     };
+    if let Some(settings) = &config.host_storage {
+        plan.push(service(
+            READY_UNIT,
+            vec![
+                binary.to_path_buf(),
+                systemd_dir.join(storage::PREPARE_UNIT),
+                systemd_dir.join(storage::mount_unit_name(settings)),
+                systemd_dir.join(READY_UNIT),
+            ],
+        )?);
+    }
     if let Some(settings) = config.volumes.zerofs() {
-        let zerofs = vec![
+        let mut zerofs = vec![
             settings.binary.clone(),
             settings.config_file.clone(),
             systemd_dir.join(ZEROFS_UNIT),
         ];
+        if config.host_storage.is_some() {
+            zerofs.push(systemd_dir.join(format!("{ZEROFS_UNIT}.d/{}", storage::DROP_IN)));
+        }
         plan.push(service(ZEROFS_UNIT, zerofs.clone())?);
         let mut mount = zerofs;
         mount.push(systemd_dir.join(MOUNT_UNIT));
@@ -311,6 +332,9 @@ fn plan(config: &HostConfig, systemd_dir: &Path, binary: &Path) -> Result<Vec<Se
         systemd_dir.join(DAEMON_UNIT),
         systemd_dir.join(crate::install::render::DAEMON_DROP_IN),
     ];
+    if config.host_storage.is_some() {
+        daemon.push(systemd_dir.join(format!("{DAEMON_UNIT}.d/{}", storage::DROP_IN)));
+    }
     if let Some(settings) = config.volumes.zerofs() {
         daemon.push(settings.checkpoint_config_file.clone());
     }
@@ -640,6 +664,16 @@ mod tests {
                     (MOUNT_UNIT.to_string(), render::mount_unit(settings, &file)),
                 ]);
             }
+            files.extend(
+                storage::files(&self.config, &file, &binary)
+                    .into_iter()
+                    .map(|(path, body)| {
+                        (
+                            path.strip_prefix(SYSTEMD_DIR).unwrap().display().to_string(),
+                            body,
+                        )
+                    }),
+            );
             for (unit, body) in files {
                 write_generated(&root.join("systemd").join(unit), &body, false, &mut laid).unwrap();
             }
@@ -702,6 +736,126 @@ mod tests {
             };
             settings.cache_disk_mib += 1024;
         }
+
+        fn manage_storage(&mut self) {
+            let mount_point = self.directory.path().join("data");
+            self.config.snapshot_dir = mount_point.join("snapshots");
+            self.config.host_storage = Some(crate::config::HostStorage {
+                device: "/dev/nibrunner-test-storage".into(),
+                mount_point: mount_point.clone(),
+                filesystem: crate::config::StorageFilesystem::Ext4,
+            });
+            let VolumeBackend::Zerofs(settings) = &mut self.config.volumes else {
+                panic!("ZeroFS host")
+            };
+            settings.cache_dir = mount_point.join("cache");
+            settings.checkpoint_cache_dir = mount_point.join("checkpoint-cache");
+        }
+    }
+
+    #[test]
+    fn storage_starts_first_and_pending_preparation_never_restarts_its_consumers() {
+        let mut host = HostFiles::new();
+        host.manage_storage();
+        host.install();
+        let systemd = FakeSystemd::default();
+        let outcomes = host.start(&systemd, false).unwrap();
+        assert_eq!(
+            outcomes.iter().map(|(unit, _)| *unit).collect::<Vec<_>>(),
+            [READY_UNIT, ZEROFS_UNIT, MOUNT_UNIT, DAEMON_UNIT]
+        );
+        assert!(systemd
+            .commands
+            .borrow()
+            .iter()
+            .any(|command| command == &["start", READY_UNIT]));
+        assert!(systemd
+            .commands
+            .borrow()
+            .iter()
+            .filter(|command| command[0] == "enable")
+            .all(|command| !command.iter().any(|unit| unit == READY_UNIT)));
+        systemd.commands.borrow_mut().clear();
+        assert!(host
+            .start(&systemd, false)
+            .unwrap()
+            .iter()
+            .all(|(_, outcome)| *outcome == Outcome::Running));
+        assert!(!systemd
+            .commands
+            .borrow()
+            .iter()
+            .any(|command| matches!(command[0].as_str(), "start" | "restart")));
+        std::fs::write(host.directory.path().join("nibrunnerd"), "upgraded daemon").unwrap();
+        assert_eq!(host.pending(&systemd), [true, false, false, true]);
+        systemd.commands.borrow_mut().clear();
+        assert_eq!(
+            host.start(&systemd, false).unwrap(),
+            [
+                (READY_UNIT, Outcome::Running),
+                (ZEROFS_UNIT, Outcome::Running),
+                (MOUNT_UNIT, Outcome::Running),
+                (DAEMON_UNIT, Outcome::Restarted),
+            ]
+        );
+        assert!(!systemd
+            .commands
+            .borrow()
+            .iter()
+            .any(|command| command[0] == "restart" && command[1] != DAEMON_UNIT));
+        assert_eq!(host.pending(&systemd), [false, false, false, false]);
+    }
+
+    #[test]
+    fn changed_storage_dependencies_keep_the_zerofs_restart_permission_requirement() {
+        let mut host = HostFiles::new();
+        host.manage_storage();
+        host.install();
+        let systemd = FakeSystemd::default();
+        host.start(&systemd, false).unwrap();
+        let dependency = host
+            .directory
+            .path()
+            .join("systemd")
+            .join(format!("{ZEROFS_UNIT}.d/{}", storage::DROP_IN));
+        let mut body = std::fs::read_to_string(&dependency).unwrap();
+        body.push_str("\nTimeoutStartSec=90\n");
+        std::fs::write(&dependency, body).unwrap();
+        assert_eq!(host.pending(&systemd), [false, true, true, false]);
+        systemd.commands.borrow_mut().clear();
+        assert!(host
+            .start(&systemd, false)
+            .unwrap_err()
+            .to_string()
+            .contains("--restart-zerofs"));
+        assert!(systemd.commands.borrow().is_empty());
+        assert_eq!(
+            host.start(&systemd, true).unwrap()[1],
+            (ZEROFS_UNIT, Outcome::Restarted)
+        );
+        host.config.host_storage = None;
+        std::fs::remove_file(dependency).unwrap();
+        assert_eq!(host.pending(&systemd), [true, true, true]);
+        assert!(host.start(&systemd, false).is_err());
+    }
+
+    #[test]
+    fn failed_storage_preparation_leaves_consumers_unstarted_and_their_inputs_pending() {
+        let mut host = HostFiles::new();
+        host.manage_storage();
+        host.install();
+        let systemd = FakeSystemd::default();
+        systemd.fail.set(Some(READY_UNIT));
+        assert_eq!(
+            host.start(&systemd, false).unwrap(),
+            [(READY_UNIT, Outcome::Failed)]
+        );
+        assert_eq!(host.pending(&systemd), [true, true, true, true]);
+        assert!(!systemd
+            .commands
+            .borrow()
+            .iter()
+            .any(|command| matches!(command[0].as_str(), "start" | "restart") && command[1] != READY_UNIT));
     }
 
     #[test]
