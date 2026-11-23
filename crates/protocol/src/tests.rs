@@ -233,6 +233,7 @@ fn desired_json() -> serde_json::Value {
             "volumeId": "vol-1",
             "appId": "app-1",
             "sizeBytes": 4096,
+            "storage": null,
             "desiredState": "present",
             "initialContents": {
                 "digest": "c".repeat(64),
@@ -1409,4 +1410,81 @@ fn jwt_policies_preserve_their_settings_and_refuse_unknown_options() {
         invalid[key] = value;
         assert!(serde_json::from_value::<crate::JwtAccessPolicy>(invalid).is_err());
     }
+}
+
+fn volume_with_storage(auth: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "volumeId": "vol-1", "appId": "app-1", "sizeBytes": 4096, "desiredState": "present",
+        "storage": {
+            "endpoint": "https://s3.example.com", "bucket": "example", "prefix": "apps/one",
+            "region": null, "auth": auth, "encryptionPassword": "private-password"
+        }
+    })
+}
+
+#[test]
+fn a_customer_volume_preserves_all_authentication_modes_without_logging_credentials() {
+    for auth in [
+        serde_json::json!({"kind":"anonymous"}),
+        serde_json::json!({"kind":"access-key", "accessKeyId":"private-id", "secretAccessKey":"private-key"}),
+        serde_json::json!({"kind":"session", "accessKeyId":"private-id", "secretAccessKey":"private-key", "sessionToken":"private-token"}),
+    ] {
+        let wire = volume_with_storage(auth);
+        let volume = serde_json::from_value::<DesiredVolume>(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&volume).unwrap(), wire);
+        assert!(!format!("{volume:?}").contains("private-"));
+    }
+}
+
+#[test]
+fn malformed_explicit_storage_is_never_read_as_host_storage_or_printed_in_an_error() {
+    for (field, invalid) in [
+        ("auth", serde_json::json!({"kind":"private-invalid"})),
+        (
+            "auth",
+            serde_json::json!({"kind":"anonymous","private-unexpected":true}),
+        ),
+        ("encryptionPassword", serde_json::json!("")),
+        ("region", serde_json::json!("")),
+        ("endpoint", serde_json::json!("http://private-host")),
+        ("bucket", serde_json::json!("/private-path")),
+    ] {
+        let mut invalid_wire = volume_with_storage(serde_json::json!({"kind":"anonymous"}));
+        invalid_wire["storage"][field] = invalid;
+        let error = serde_json::from_value::<DesiredVolume>(invalid_wire).unwrap_err();
+        assert!(!error.to_string().contains("private-"));
+    }
+}
+
+#[test]
+fn the_schema_requires_storage_but_legacy_volumes_still_round_trip_to_explicit_null() {
+    let validator = jsonschema::validator_for(&schemars::schema_for!(DesiredVolume).to_value()).unwrap();
+    let mut shared = volume_with_storage(serde_json::json!({"kind":"anonymous"}));
+    shared["storage"] = serde_json::Value::Null;
+    let mut legacy = shared.clone();
+    legacy.as_object_mut().unwrap().remove("storage");
+    assert!(!validator.is_valid(&legacy));
+    assert!(validator.is_valid(&shared));
+    for input in [&legacy, &shared] {
+        let volume: DesiredVolume = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(volume).unwrap(), shared);
+    }
+}
+
+#[test]
+fn customer_storage_requires_region_even_when_its_value_is_null() {
+    let validator = jsonschema::validator_for(&schemars::schema_for!(DesiredVolume).to_value()).unwrap();
+    let mut customer = volume_with_storage(serde_json::json!({"kind":"anonymous"}));
+    for region in [None, Some("auto"), Some("eu-central-1")] {
+        customer["storage"]["region"] = serde_json::json!(region);
+        assert!(validator.is_valid(&customer));
+        let volume: DesiredVolume = serde_json::from_value(customer.clone()).unwrap();
+        assert_eq!(serde_json::to_value(volume).unwrap(), customer);
+    }
+    customer["storage"].as_object_mut().unwrap().remove("region");
+    assert!(!validator.is_valid(&customer));
+    assert!(serde_json::from_value::<DesiredVolume>(customer.clone()).is_err());
+    customer["storage"]["region"] = serde_json::json!("");
+    assert!(!validator.is_valid(&customer));
+    assert!(serde_json::from_value::<DesiredVolume>(customer).is_err());
 }
