@@ -240,6 +240,7 @@ pub async fn build_host(
     };
 
     let host = Arc::new(Host {
+        egress: Default::default(),
         cron,
         cron_execution: Arc::new(crate::adapters::cron_worker::process::DetachedCronExecution::new(
             &config,
