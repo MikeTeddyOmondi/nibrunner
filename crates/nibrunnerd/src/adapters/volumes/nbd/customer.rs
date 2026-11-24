@@ -129,17 +129,30 @@ impl NbdDevices {
         }
     }
 
+    pub(crate) async fn flush_customer(&self, target: &NbdTarget<'_>) -> Result<(), VolumeError> {
+        if !self.customer_owned(target)? {
+            return Ok(());
+        }
+        // Firecracker can leave writes in the host block cache. ZeroFS's RPC can seal only
+        // writes that have already reached its NBD server.
+        let device = target.device_path.to_owned();
+        let sync = tokio::task::spawn_blocking(move || std::fs::File::open(device)?.sync_all());
+        tokio::time::timeout(std::time::Duration::from_secs(120), sync)
+            .await
+            .map_err(|_| VolumeError::Unusable("flushing the customer block device timed out".into()))?
+            .map_err(|error| VolumeError::Unusable(error.to_string()))?
+            .map_err(|error| {
+                VolumeError::Unusable(format!("the customer block device could not be flushed: {error}"))
+            })
+    }
+
     pub(crate) async fn stop_customer(&self, target: &NbdTarget<'_>) -> Result<(), VolumeError> {
         // A client may still be negotiating before the kernel publishes a PID. Stopping its
         // specific unit also cancels that attempt without disconnecting a foreign device.
         let owned = self.customer_owned(target)?;
         let unit = target.client_unit();
-        if !owned
-            && !Path::new("/sys/fs/cgroup/system.slice")
-                .join(&unit)
-                .try_exists()
-                .map_err(|_| unavailable())?
-        {
+        let group = Path::new("/sys/fs/cgroup/system.slice").join(&unit);
+        if !owned && !group.try_exists().map_err(|_| unavailable())? {
             return Ok(());
         }
         if owned {
@@ -149,19 +162,20 @@ impl NbdDevices {
             )
             .await?;
         }
-        // Disconnect can already have made the transient unit exit and be collected.
-        if Path::new("/sys/fs/cgroup/system.slice")
-            .join(&unit)
-            .try_exists()
-            .map_err(|_| unavailable())?
-        {
-            self.client("stop the customer NBD client", &["systemctl", "stop", &unit])
-                .await?;
-        }
-        if self.customer_owned(target)? {
-            Err(unavailable())
-        } else {
-            Ok(())
+        // Disconnect can make systemd collect the transient unit between inspecting its
+        // cgroup and requesting a stop. The kernel owner and the cgroup determine completion.
+        let stop = self
+            .client("stop the customer NBD client", &["systemctl", "stop", &unit])
+            .await;
+        let deadline = tokio::time::Instant::now() + super::RELEASE_TIMEOUT;
+        loop {
+            if !self.customer_owned(target)? && !group.try_exists().map_err(|_| unavailable())? {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(stop.err().unwrap_or_else(unavailable));
+            }
+            tokio::time::sleep(RELEASE_POLL).await;
         }
     }
 }

@@ -12,8 +12,10 @@ pub(crate) fn profiles(config: &HostConfig) -> PathBuf {
     config.state_dir.join("customer-volumes")
 }
 
+pub(crate) const CACHE_DIRECTORY: &str = ".customer-zerofs-cache";
+
 pub(crate) fn caches(config: &HostConfig) -> PathBuf {
-    config.snapshot_dir.join(".customer-zerofs-cache")
+    config.snapshot_dir.join(CACHE_DIRECTORY)
 }
 
 pub(super) fn units(
@@ -41,6 +43,7 @@ LoadCredential=zerofs.toml:{profile}/%i/writer.toml
 ExecStart=\"{binary}\" run --config %d/zerofs.toml
 RuntimeDirectory=nibrunner-customer/%i
 RuntimeDirectoryMode=0700
+BindReadOnlyPaths=\"{profile}/%i/s3.hosts:/etc/hosts\"
 BindPaths=\"{cache}/%i:/var/cache/nibrunner-customer\"
 ReadWritePaths=/var/cache/nibrunner-customer
 Environment=AWS_EC2_METADATA_DISABLED=true
