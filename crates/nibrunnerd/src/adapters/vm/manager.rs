@@ -104,7 +104,7 @@ impl VmManager {
         }
     }
 
-    fn startup_failure(&self, app_id: &AppId, error: VmError) -> VmError {
+    fn startup_failure(&self, app_id: &AppId, error: super::startup::InitializationError) -> VmError {
         let status = self.processes.status(app_id);
         let process = status
             .exit
@@ -114,7 +114,11 @@ impl VmManager {
             .processes
             .console_tail(app_id)
             .unwrap_or_else(|error| format!("could not read the console: {error}"));
-        VmError::Host(format!("{error}; VMM {process}; console tail:\n{console}"))
+        let summary = protocol::StateMessage::new(format!("{error}; VMM {process}"));
+        VmError::Boot {
+            detail: format!("{summary}; console tail:\n{console}"),
+            summary,
+        }
     }
 
     fn current_stamp(&self, request: &SuspendRequest) -> SnapshotStamp {
@@ -144,7 +148,10 @@ impl VmManager {
 
     async fn stage_inputs(&self, request: &BootRequest) -> Result<PathBuf, VmError> {
         let slot = &request.slot;
-        let host = |error: crate::adapters::net::tap::NetworkError| VmError::Host(error.message());
+        let host = |error: crate::adapters::net::tap::NetworkError| VmError::Boot {
+            summary: protocol::StateMessage::new(format!("could not configure {} for the guest", error.what)),
+            detail: error.message(),
+        };
         let network = self.network.clone();
         let tap = TapInterface {
             tap_name: slot.tap_name.clone(),
@@ -552,7 +559,13 @@ impl Vmm for VmManager {
         let app_id = request.desired.app_id.clone();
         self.discard_snapshot(&app_id);
         let staged = std::time::Instant::now();
-        let prepared = self.stage(&request).await?;
+        let prepared = self.stage(&request).await.map_err(|error| match error {
+            specific @ VmError::Boot { .. } => specific,
+            other => VmError::Boot {
+                summary: protocol::StateMessage::new("could not stage the guest drives or prepare its jail"),
+                detail: other.message(),
+            },
+        })?;
         let staged_for = staged.elapsed();
 
         let starting = std::time::Instant::now();
@@ -570,7 +583,13 @@ impl Vmm for VmManager {
         if let Err(error) = started {
             self.cron_registration.detach(&app_id).await;
             let _ = self.logs.detach(&app_id).await;
-            return Err(VmError::Host(error.to_string()));
+            return Err(VmError::Boot {
+                summary: protocol::StateMessage::new(format!(
+                    "could not launch the jailed VMM ({})",
+                    error.kind()
+                )),
+                detail: error.to_string(),
+            });
         }
         let spawned_at = staged.elapsed();
         let control = prepared
@@ -1779,7 +1798,10 @@ mod tests {
             .boot(boot_request(desired_instance(|_| {})))
             .await
             .unwrap_err();
-        assert!(matches!(error, VmError::Host(_)), "{error}");
+        assert!(
+            matches!(&error, VmError::Boot { summary, .. } if summary.as_str().contains("a tap device")),
+            "{error}"
+        );
         assert!(error.message().contains("operation not permitted"), "{error}");
         assert!(fixture.manager.processes.read_record(&app_id()).is_none());
         assert!(fixture.manager.logs.attached().await.is_empty());
@@ -1819,7 +1841,10 @@ mod tests {
             .boot(boot_request(desired_instance(|_| {})))
             .await
             .unwrap_err();
-        assert!(matches!(error, VmError::Host(_)), "{error}");
+        assert!(
+            matches!(&error, VmError::Boot { summary, .. } if summary.as_str().contains("could not launch the jailed VMM")),
+            "{error}"
+        );
         assert!(
             fixture.manager.logs.attached().await.is_empty(),
             "a socket nothing will write to is not left listening"

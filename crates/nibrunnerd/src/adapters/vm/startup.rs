@@ -3,8 +3,6 @@ use std::time::Duration;
 
 use tokio::io::{AsyncWriteExt, BufReader};
 
-use crate::ports::VmError;
-
 use super::CONTROL_RETRY_INTERVAL;
 
 pub(super) async fn sample(path: &Path) -> Option<crate::ports::GuestStartupSample> {
@@ -39,30 +37,38 @@ pub(super) async fn sample(path: &Path) -> Option<crate::ports::GuestStartupSamp
 const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum InitializationError {
+    #[error("the microVM exited before its guest initialized")]
+    Exited,
+    #[error("permission was denied connecting to the guest control socket")]
+    PermissionDenied,
+    #[error("the guest did not initialize within 60s")]
+    TimedOut,
+}
+
 // PID 1 opens this port after mounting its filesystems and preparing the tenant cgroup.
 pub(super) async fn initialized(
     path: &Path,
     jail_uid: u32,
     active: impl Fn() -> bool,
-) -> Result<(), VmError> {
+) -> Result<(), InitializationError> {
     tokio::time::timeout(INITIALIZATION_TIMEOUT, async {
         loop {
             if !active() {
-                return Err(VmError::Host(
-                    "the microVM exited before its guest initialized".into(),
-                ));
+                return Err(InitializationError::Exited);
             }
             match connect(path, jail_uid).await {
                 Ok(()) => return Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    return Err(VmError::Host(error.to_string()));
+                    return Err(InitializationError::PermissionDenied);
                 }
                 Err(_) => tokio::time::sleep(CONTROL_RETRY_INTERVAL).await,
             }
         }
     })
     .await
-    .map_err(|_| VmError::Host("the guest did not initialize within 60s".into()))?
+    .map_err(|_| InitializationError::TimedOut)?
 }
 
 async fn connect(path: &Path, jail_uid: u32) -> std::io::Result<()> {
@@ -134,7 +140,7 @@ mod tests {
         let error = initialized(&directory.path().join("missing"), 0, || true)
             .await
             .unwrap_err();
-        assert!(error.message().contains("within 60s"));
+        assert!(error.to_string().contains("within 60s"));
     }
 
     #[tokio::test]
@@ -148,6 +154,6 @@ mod tests {
             result = &mut waiting => panic!("initialization ended before exit: {result:?}"),
             () = tokio::time::sleep(CONTROL_RETRY_INTERVAL) => active.store(false, Ordering::Relaxed),
         }
-        assert!(waiting.await.unwrap_err().message().contains("exited"));
+        assert!(waiting.await.unwrap_err().to_string().contains("exited"));
     }
 }
